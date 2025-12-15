@@ -331,7 +331,9 @@ static void PgExtensionBaseWorkerSharedMemoryExit(int code, Datum arg);
 static int32 InsertBaseWorkerRegistration(char *workerName, Oid extensionId,
 										  Oid entryPointFunctionId);
 static bool DatabaseIsTemplate(Oid databaseId);
+static int32 DeregisterBaseWorker_internal(int32 workerId);
 static int32 DeleteBaseWorkerRegistrationByName(char *extensionName);
+static void DeleteBaseWorkerRegistrationById(int32 workerId);
 static void DeleteBaseWorkerRegistrationsByExtensionId(Oid extensionId);
 static Oid	PgExtensionBaseWorkersRelationId(void);
 static Oid	PgExtensionSchemaId(void);
@@ -1976,6 +1978,12 @@ PgExtensionBaseWorkerSharedMemoryExit(int code, Datum arg)
 Datum
 pg_extension_base_register_worker(PG_FUNCTION_ARGS)
 {
+	if (!creating_extension)
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("can only register workers from extensions")));
+	}
+
 	char	   *workerName = text_to_cstring(PG_GETARG_TEXT_P(0));
 	Oid			entryPointFunctionId = PG_GETARG_OID(1);
 
@@ -2029,12 +2037,6 @@ RegisterBaseWorker(char *workerName, Oid entryPointFunctionId, Oid extensionId)
 						errmsg("function must have internal return type")));
 	}
 
-	if (!creating_extension)
-	{
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("can only register workers from extensions")));
-	}
-
 	int32		workerId = InsertBaseWorkerRegistration(workerName,
 														extensionId,
 														entryPointFunctionId);
@@ -2085,9 +2087,22 @@ RegisterBaseWorker(char *workerName, Oid entryPointFunctionId, Oid extensionId)
 Datum
 pg_extension_base_deregister_worker(PG_FUNCTION_ARGS)
 {
-	char	   *workerName = text_to_cstring(PG_GETARG_TEXT_P(0));
+	Oid			argtype = get_fn_expr_argtype(fcinfo->flinfo, 0);
 
-	DeregisterBaseWorker(workerName);
+	if (argtype == INT4OID)
+	{
+		DeregisterBaseWorkerById(PG_GETARG_INT32(0));
+	}
+	else if (argtype == TEXTOID)
+	{
+		char	   *workerName = text_to_cstring(PG_GETARG_TEXT_P(0));
+
+		DeregisterBaseWorker(workerName);
+	}
+	else
+	{
+		ereport(ERROR, (errmsg("unrecognized argument type")));
+	}
 
 	PG_RETURN_VOID();
 }
@@ -2104,6 +2119,31 @@ DeregisterBaseWorker(char *workerName)
 	 */
 	int			workerId = DeleteBaseWorkerRegistrationByName(workerName);
 
+	return DeregisterBaseWorker_internal(workerId);
+}
+
+
+/*
+ * DeregisterBaseWorkerById stops and removes a base worker by id.
+ */
+int32
+DeregisterBaseWorkerById(int32 workerId)
+{
+	/*
+	 * Delete base worker from the database.
+	 */
+	DeleteBaseWorkerRegistrationById(workerId);
+
+	return DeregisterBaseWorker_internal(workerId);
+}
+
+
+/*
+ * Handle the actual deregistration of the base worker, whatever the caller.
+ */
+static int32
+DeregisterBaseWorker_internal(int32 workerId)
+{
 	/*
 	 * Prepare for rollback by restarting the database starter. It will
 	 * resurrect our base worker if it still sees it in the database.
@@ -2271,6 +2311,33 @@ DeleteBaseWorkerRegistrationByName(char *workerName)
 	return workerId;
 }
 
+/*
+ * DeleteBaseWorkerRegistrationById deletes an entry from pg_extension_base.workers
+ * by id.
+ */
+static void
+DeleteBaseWorkerRegistrationById(int32 workerId)
+{
+	SPI_connect();
+
+	int			argCount = 1;
+	Oid			argTypes[] = {INT4OID};
+	Datum		argValues[] = {workerId};
+
+	const char *argNulls = " ";
+	bool		readOnly = false;
+	long		limit = 0;
+
+	SPI_execute_with_args("delete from " PG_EXTENSION_BASE_SCHEMA_NAME ".workers "
+						  "where worker_id operator(pg_catalog.=) $1",
+						  argCount, argTypes, argValues, argNulls,
+						  readOnly, limit);
+
+	if (SPI_processed != 1)
+		ereport(ERROR, (errmsg("could not find worker id %d", workerId)));
+
+	SPI_finish();
+}
 
 /*
  * DeleteBaseWorkerRegistrationByExtensionId deletes all entries from pg_extension_base.workers
