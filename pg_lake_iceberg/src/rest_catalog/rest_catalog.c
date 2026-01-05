@@ -30,23 +30,23 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
-#include "pg_lake/iceberg/api/table_schema.h"
-#include "pg_lake/iceberg/metadata_spec.h"
-
+#include "pg_extension_base/base_workers.h"
 #include "pg_lake/http/http_client.h"
-#include "pg_lake/object_store_catalog/object_store_catalog.h"
-#include "pg_lake/rest_catalog/rest_catalog.h"
+#include "pg_lake/iceberg/api/table_schema.h"
 #include "pg_lake/iceberg/catalog.h"
+#include "pg_lake/iceberg/metadata_spec.h"
+#include "pg_lake/iceberg/temporal_utils.h"
 #include "pg_lake/json/json_utils.h"
+#include "pg_lake/object_store_catalog/object_store_catalog.h"
 #include "pg_lake/parsetree/options.h"
+#include "pg_lake/rest_catalog/rest_catalog.h"
 #include "pg_lake/util/url_encode.h"
 #include "pg_lake/util/rel_utils.h"
-#include "pg_lake/iceberg/temporal_utils.h"
 
 
 /* determined by GUC */
 char	   *RestCatalogHost = "http://localhost:8181";
-char       *RestCatalogOauthHostPath = "";
+char	   *RestCatalogOauthHostPath = "";
 char	   *RestCatalogClientId = NULL;
 char	   *RestCatalogClientSecret = NULL;
 
@@ -57,7 +57,7 @@ char	   *RestCatalogClientSecret = NULL;
 char	   *RestCatalogAccessToken = NULL;
 TimestampTz RestCatalogAccessTokenExpiry = 0;
 
-static char *GetRestCatalogAccessToken(void);
+static char *GetRestCatalogAccessToken(bool forceRefreshToken);
 static void FetchRestCatalogAccessToken(char **accessToken, int *expiresIn);
 static void CreateNamespaceOnRestCatalog(const char *catalogName, const char *namespaceName);
 static char *EncodeBasicAuth(const char *clientId, const char *clientSecret);
@@ -120,7 +120,7 @@ StartStageRestCatalogIcebergTableCreate(Oid relationId)
 
 	headers = lappend(headers, vendedCreds);
 
-	HttpResult	httpResult = HttpPost(postUrl, body->data, headers);
+	HttpResult	httpResult = SendRequestToRestCatalog(HTTP_POST, postUrl, body->data, headers);
 
 	if (httpResult.status != 200)
 	{
@@ -254,7 +254,7 @@ RegisterNamespaceToRestCatalog(const char *catalogName, const char *namespaceNam
 		psprintf(REST_CATALOG_NAMESPACE_NAME,
 				 RestCatalogHost, URLEncodePath(catalogName),
 				 URLEncodePath(namespaceName));
-	HttpResult	httpResult = HttpGet(getUrl, GetHeadersWithAuth());
+	HttpResult	httpResult = SendRequestToRestCatalog(HTTP_GET, getUrl, NULL, GetHeadersWithAuth());
 
 	switch (httpResult.status)
 	{
@@ -341,7 +341,7 @@ ErrorIfRestNamespaceDoesNotExist(const char *catalogName, const char *namespaceN
 		psprintf(REST_CATALOG_NAMESPACE_NAME,
 				 RestCatalogHost, URLEncodePath(catalogName),
 				 URLEncodePath(namespaceName));
-	HttpResult	httpResult = HttpGet(getUrl, GetHeadersWithAuth());
+	HttpResult	httpResult = SendRequestToRestCatalog(HTTP_GET, getUrl, NULL, GetHeadersWithAuth());
 
 
 	/* namespace not found */
@@ -389,7 +389,7 @@ GetMetadataLocationFromRestCatalog(const char *restCatalogName, const char *name
 				 RestCatalogHost, URLEncodePath(restCatalogName), URLEncodePath(namespaceName), URLEncodePath(relationName));
 
 	List	   *headers = GetHeadersWithAuth();
-	HttpResult	hr = HttpGet(getUrl, headers);
+	HttpResult	hr = SendRequestToRestCatalog(HTTP_GET, getUrl, NULL, headers);
 
 	if (hr.status != 200)
 	{
@@ -432,7 +432,7 @@ CreateNamespaceOnRestCatalog(const char *catalogName, const char *namespaceName)
 		psprintf(REST_CATALOG_NAMESPACE, RestCatalogHost,
 				 URLEncodePath(catalogName));
 
-	HttpResult	httpResult = HttpPost(postUrl, body.data, PostHeadersWithAuth());
+	HttpResult	httpResult = SendRequestToRestCatalog(HTTP_POST, postUrl, body.data, PostHeadersWithAuth());
 
 	if (httpResult.status != 200)
 	{
@@ -446,7 +446,9 @@ CreateNamespaceOnRestCatalog(const char *catalogName, const char *namespaceName)
 List *
 PostHeadersWithAuth(void)
 {
-	return list_make3(psprintf("Authorization: Bearer %s", GetRestCatalogAccessToken()),
+	bool		forceRefreshToken = false;
+
+	return list_make3(psprintf("Authorization: Bearer %s", GetRestCatalogAccessToken(forceRefreshToken)),
 					  pstrdup("Accept: application/json"),
 					  pstrdup("Content-Type: application/json"));
 }
@@ -459,7 +461,9 @@ PostHeadersWithAuth(void)
 List *
 DeleteHeadersWithAuth(void)
 {
-	return list_make1(psprintf("Authorization: Bearer %s", GetRestCatalogAccessToken()));
+	bool		forceRefreshToken = false;
+
+	return list_make1(psprintf("Authorization: Bearer %s", GetRestCatalogAccessToken(forceRefreshToken)));
 }
 
 
@@ -470,7 +474,9 @@ DeleteHeadersWithAuth(void)
 static List *
 GetHeadersWithAuth(void)
 {
-	return list_make2(psprintf("Authorization: Bearer %s", GetRestCatalogAccessToken()),
+	bool		forceRefreshToken = false;
+
+	return list_make2(psprintf("Authorization: Bearer %s", GetRestCatalogAccessToken(forceRefreshToken)),
 					  pstrdup("Accept: application/json"));
 }
 
@@ -516,7 +522,7 @@ ReportHTTPError(HttpResult httpResult, int level)
 * configured via GUC variables. Caches the token until it is about to expire.
 */
 static char *
-GetRestCatalogAccessToken(void)
+GetRestCatalogAccessToken(bool forceRefreshToken)
 {
 	/*
 	 * Calling initial time or token will expire in 1 minute, fetch a new
@@ -525,7 +531,7 @@ GetRestCatalogAccessToken(void)
 	TimestampTz now = GetCurrentTimestamp();
 	const int	MINUTE_IN_MSECS = 60 * 1000;
 
-	if (RestCatalogAccessTokenExpiry == 0 ||
+	if (forceRefreshToken || RestCatalogAccessTokenExpiry == 0 ||
 		!TimestampDifferenceExceeds(now, RestCatalogAccessTokenExpiry, MINUTE_IN_MSECS))
 	{
 		if (RestCatalogAccessToken)
@@ -564,11 +570,14 @@ FetchRestCatalogAccessToken(char **accessToken, int *expiresIn)
 	if (!RestCatalogClientSecret || !*RestCatalogClientSecret)
 		ereport(ERROR, (errmsg("pg_lake_iceberg.rest_catalog_client_secret should be set")));
 
-    char *accessTokenUrl = RestCatalogOauthHostPath;
+	char	   *accessTokenUrl = RestCatalogOauthHostPath;
 
-    /* if pg_lake_iceberg.rest_catalog_oauth_host_path is not set, use Polaris' default oauth token endpoint */
-    if (*accessTokenUrl == '\0')
-        accessTokenUrl = psprintf(REST_CATALOG_AUTH_TOKEN_PATH, RestCatalogHost);
+	/*
+	 * if pg_lake_iceberg.rest_catalog_oauth_host_path is not set, use
+	 * Polaris' default oauth token endpoint
+	 */
+	if (*accessTokenUrl == '\0')
+		accessTokenUrl = psprintf(REST_CATALOG_AUTH_TOKEN_PATH, RestCatalogHost);
 
 	/* Build Authorization: Basic <base64(clientId:clientSecret)> */
 	char	   *encodedAuth = EncodeBasicAuth(RestCatalogClientId, RestCatalogClientSecret);
@@ -584,7 +593,7 @@ FetchRestCatalogAccessToken(char **accessToken, int *expiresIn)
 	headers = lappend(headers, "Content-Type: application/x-www-form-urlencoded");
 
 	/* POST */
-	HttpResult	httpResponse = HttpPost(accessTokenUrl, body, headers);
+	HttpResult	httpResponse = SendRequestToRestCatalog(HTTP_POST, accessTokenUrl, body, headers);
 
 	if (httpResponse.status != 200)
 		ereport(ERROR,
@@ -1024,4 +1033,77 @@ GetRemoveSnapshotCatalogRequest(List *removedSnapshotIds, Oid relationId)
 	request->body = body->data;
 
 	return request;
+}
+
+
+/*
+ * SendRequestToRestCatalog sends an HTTP request to the rest catalog
+ * with retry logic for retriable errors, attempting up to MAX_HTTP_RETRY_FOR_REST_CATALOG
+ * times.
+ */
+HttpResult
+SendRequestToRestCatalog(HttpMethod method, const char *url, const char *body, List *headers)
+{
+	const int	MAX_HTTP_RETRY_FOR_REST_CATALOG = 3;
+
+	return SendHttpRequestWithRetry(method, url, body, headers, ShouldRetryRequestToRestCatalog, MAX_HTTP_RETRY_FOR_REST_CATALOG);
+}
+
+
+/*
+ * ShouldRetryRequestToRestCatalog checks if the given HTTP result status is retriable.
+ * If it is retriable, it performs necessary actions (like sleeping or refreshing token)
+ * and returns true. Otherwise, it returns false.
+ */
+bool
+ShouldRetryRequestToRestCatalog(long status, int maxRetry, int retryNo)
+{
+	if (retryNo > maxRetry)
+		return false;
+
+	const int	TOO_MANY_REQUEST_STATUS = 429;
+	const int	SERVER_UNAVAILABLE_STATUS = 503;
+	const int	TOKEN_EXPIRED_STATUS = 419;
+
+	/* too many request, wait some time */
+	if (status == TOO_MANY_REQUEST_STATUS)
+	{
+		int			baseMs = 500;
+
+		/*
+		 * LightSleep reacts to signals, and can easily throw an error (e.g.,
+		 * cancel backend). This function can be called at post-commit hook,
+		 * so normally we wouldn't want any errors to happen, but then
+		 * Postgres already prevents post-commit backends to receive signals.
+		 */
+		LightSleep(LinearBackoffSleepMs(baseMs, retryNo));
+		return true;
+	}
+
+	/* server unavailable, lets wait a bit more */
+	else if (status == SERVER_UNAVAILABLE_STATUS)
+	{
+		int			baseMs = 5000;
+
+		LightSleep(LinearBackoffSleepMs(baseMs, retryNo));
+		return true;
+	}
+
+	/* token expired, retry after refreshing token */
+	else if (status == TOKEN_EXPIRED_STATUS)
+	{
+		/*
+		 * We normally refresh the token only when it is about to expire
+		 * (forceRefreshToken = false), just 1 minute before the expiration
+		 * for each request. Retry logic makes it safer by ensuring we get a
+		 * fresh token for unforeseen circumstances.
+		 */
+		bool		forceRefreshToken = true;
+
+		GetRestCatalogAccessToken(forceRefreshToken);
+		return true;
+	}
+
+	/* successful or other error, no retry */
+	return false;
 }

@@ -31,6 +31,7 @@
 #include "utils/memutils.h"
 #include "pg_lake/http/http_client.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <curl/curl.h>
@@ -42,16 +43,7 @@
 #define TOTAL_TIMEOUT_MS   180000
 
 
-typedef enum
-{
-	HTTP_GET,
-	HTTP_HEAD,
-	HTTP_POST,
-	HTTP_PUT,
-	HTTP_DELETE
-}			HttpMethod;
-
-
+static HttpResult SendHttpRequest(HttpMethod method, const char *url, const char *body, List *headers);
 static HttpResult HttpCommonNoThrows(HttpMethod method, const char *url, const char *postData,
 									 const List *headers);
 static bool CheckMinCurlVersion(const curl_version_info_data * versionInfo);
@@ -280,6 +272,90 @@ CurlReturnError(CURL * curl, struct curl_slist *headerList,
 
 
 /*
+ * SendHttpRequestWithRetry sends an HTTP request with the given method, url, body, headers,
+ * and retry callback.
+ */
+HttpResult
+SendHttpRequestWithRetry(HttpMethod method, const char *url, const char *body,
+						 List *headers, HttpRetryFn retryFn, int maxRetry)
+{
+	Assert(maxRetry > 0);
+
+	HttpResult	result;
+
+	for (int retryNo = 1; retryNo <= maxRetry; retryNo++)
+	{
+		result = SendHttpRequest(method, url, body, headers);
+
+		if (retryFn != NULL && retryFn(result.status, maxRetry, retryNo))
+			continue;
+		else
+			break;
+	}
+
+	return result;
+}
+
+
+static HttpResult
+SendHttpRequest(HttpMethod method, const char *url, const char *body, List *headers)
+{
+	HttpResult	result;
+
+	if (method == HTTP_GET)
+	{
+		Assert(body == NULL);
+		result = HttpGet(url, headers);
+	}
+	else if (method == HTTP_HEAD)
+	{
+		Assert(body == NULL);
+		result = HttpHead(url, headers);
+	}
+	else if (method == HTTP_POST)
+	{
+		result = HttpPost(url, body, headers);
+	}
+	else if (method == HTTP_PUT)
+	{
+		result = HttpPut(url, body, headers);
+	}
+	else if (method == HTTP_DELETE)
+	{
+		Assert(body == NULL);
+		result = HttpDelete(url, headers);
+	}
+	else
+	{
+		pg_unreachable();
+	}
+
+	return result;
+}
+
+
+/*
+ * LinearBackoffSleepMs returns sleep duration in milliseconds
+ * for the current retry no using linear backoff with jitter.
+ */
+int
+LinearBackoffSleepMs(int baseMs, int retryNo)
+{
+	const int	maxMs = 10000;	/* cap at 10 s */
+
+	int			sleepMs = baseMs * retryNo;
+
+	if (sleepMs > maxMs)
+		sleepMs = maxMs;
+
+	/* add some jitter up to baseMs */
+	sleepMs += (rand() % baseMs);
+
+	return sleepMs;
+}
+
+
+/*
  * HttpGet performs a simple HTTP GET request.
  * Returns an HttpResult with status, body, and headers.
  */
@@ -319,7 +395,6 @@ HttpDelete(const char *url, List *headers)
 {
 	return HttpCommonNoThrows(HTTP_DELETE, url, NULL, headers);
 }
-
 
 
 /* CurlResponseBodyWriteCallback grows response body from libcurl buffer. */

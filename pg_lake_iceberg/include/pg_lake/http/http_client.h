@@ -24,6 +24,15 @@
 #include "postgres.h"
 #include "nodes/pg_list.h"
 
+typedef enum
+{
+	HTTP_GET,
+	HTTP_HEAD,
+	HTTP_POST,
+	HTTP_PUT,
+	HTTP_DELETE
+}			HttpMethod;
+
 typedef struct
 {
 	long		status;			/* e.g., 200, 404        */
@@ -36,9 +45,15 @@ typedef struct
 
 extern bool HttpClientTraceTraffic;
 
+/* Callback function to determine if a request should be retried */
+typedef bool (*HttpRetryFn) (long status, int maxRetry, int retryNo);
+
 /* plain C API (no PostgreSQL types) */
 extern PGDLLEXPORT HttpResult HttpGet(const char *url, List *headers);
 extern PGDLLEXPORT HttpResult HttpHead(const char *url, List *headers);
 extern PGDLLEXPORT HttpResult HttpPost(const char *url, const char *body, List *headers);
 extern PGDLLEXPORT HttpResult HttpDelete(const char *url, List *headers);
 extern PGDLLEXPORT HttpResult HttpPut(const char *url, const char *body, List *headers);
+extern PGDLLEXPORT HttpResult SendHttpRequestWithRetry(HttpMethod method, const char *url, const char *body,
+													   List *headers, HttpRetryFn retryFn, int maxRetry);
+extern PGDLLEXPORT int LinearBackoffSleepMs(int baseMs, int retryNo);
