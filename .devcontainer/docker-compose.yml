@@ -1,0 +1,62 @@
+services:
+  dev_base:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: dev_base
+    image: pg_lake-dev_base:local
+
+  devcontainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: pg_lake-dev_base:local
+    depends_on:
+      - dev_base
+      - minio
+    user: postgres
+    volumes:
+      - ..:/home/postgres/pg_lake:cached
+      - pg_lake-pgdata:/home/postgres/pgsql-18/data
+      - pg_lake-cache:/tmp/cache
+    environment:
+      - PG_MAJOR=18
+      - PATH=/home/postgres/pgsql-18/bin:/home/postgres/vcpkg:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - VCPKG_TOOLCHAIN_PATH=/home/postgres/vcpkg/scripts/buildsystems/vcpkg.cmake
+      - PGDATA=/home/postgres/pgsql-18/data
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    ports:
+      - "5432:5432"
+      - "5332:5332"
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      mc mb myminio/test-bucket --ignore-existing;
+      exit 0;
+      "
+
+volumes:
+  pg_lake-pgdata:
+  pg_lake-cache:
+  minio-data:
