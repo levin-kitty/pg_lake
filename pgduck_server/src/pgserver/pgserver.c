@@ -324,12 +324,18 @@ set_unix_socket_permissions(char *unixSocketPath, char *groupName, int permissio
 
 
 volatile sig_atomic_t running = 1;
+static int listening_socket_fd = -1;
 
 /* basic sigint handler */
 static void
 handle_signal(int sig)
 {
 	running = 0;
+	if (listening_socket_fd != -1)
+	{
+		close(listening_socket_fd);
+		listening_socket_fd = -1;
+	}
 }
 
 
@@ -364,6 +370,8 @@ pgserver_run(PGServer * pgServer)
 		exit(STATUS_ERROR);
 	}
 
+	listening_socket_fd = pgServer->listeningSocket;
+
 	while (running)
 	{
 		PGClient   *client = (PGClient *) pg_malloc0(sizeof(PGClient));
@@ -375,6 +383,9 @@ pgserver_run(PGServer * pgServer)
 
 		if (client->clientSocket < 0)
 		{
+			if (!running && (errno == EINTR || errno == EBADF))
+				break;
+
 			PGDUCK_SERVER_ERROR("Could not accept the client: %s",
 								strerror(errno));
 
@@ -486,6 +497,13 @@ static void *
 pgclient_thread_main(void *arg)
 {
 	PgClientThreadInitState *initState = (PgClientThreadInitState *) arg;
+	sigset_t	blocked;
+
+	/* Ensure SIGINT/SIGTERM are handled by the main thread. */
+	sigemptyset(&blocked);
+	sigaddset(&blocked, SIGINT);
+	sigaddset(&blocked, SIGTERM);
+	pthread_sigmask(SIG_BLOCK, &blocked, NULL);
 
 	/* cleanup handler */
 	pthread_cleanup_push(pgclient_thread_cleanup, arg);
