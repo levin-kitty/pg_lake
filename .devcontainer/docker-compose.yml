@@ -1,0 +1,60 @@
+services:
+  devcontainer:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+      args:
+        BASE_IMAGE_OS: almalinux
+        BASE_IMAGE_TAG: "9"
+        PG17_VERSION: "17.7"
+    volumes:
+      - ..:/workspaces/pg_lake:cached
+      - pgdata:/home/postgres/pgsql-17/data
+      - pgduck-socket:/home/postgres/pgduck_socket_dir
+    command: sleep infinity
+    environment:
+      PG_MAJOR: "17"
+      PGBASEDIR: /home/postgres
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_BUCKET: localbucket
+      MINIO_ROOT_USER: testkey
+      MINIO_ROOT_PASSWORD: testpassword
+      PG_LAKE_S3_PREFIX: s3://localbucket/pg_lake/
+      AWS_ACCESS_KEY_ID: testkey
+      AWS_SECRET_ACCESS_KEY: testpassword
+    ports:
+      - "5432:5432"
+    cap_add:
+      - SYS_PTRACE
+    depends_on:
+      - minio
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: testkey
+      MINIO_ROOT_PASSWORD: testpassword
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: testkey
+      MINIO_ROOT_PASSWORD: testpassword
+      MINIO_BUCKET: localbucket
+    volumes:
+      - ../.devcontainer/scripts:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/minio-init.sh"]
+    restart: "no"
+
+volumes:
+  pgdata:
+  pgduck-socket:
+  minio-data:

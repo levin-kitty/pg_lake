@@ -1,0 +1,20 @@
+{
+  "name": "pg_lake dev (PG17 + MinIO)",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "devcontainer",
+  "workspaceFolder": "/workspaces/pg_lake",
+  "remoteUser": "postgres",
+  "overrideCommand": false,
+  "postCreateCommand": "git config --global --add safe.directory /workspaces/pg_lake && git submodule update --init --recursive && pipenv install --dev",
+  "postStartCommand": "bash .devcontainer/scripts/start-services.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "ms-python.python",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
+}
